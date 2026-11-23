@@ -367,6 +367,7 @@ let items = [];
 let editingId = null;
 let selectedIds = new Set();
 let apiUrl = HARDCODED_API_URL || localStorage.getItem(API_KEY) || '';
+let lastSaveError = '';
 let serverLoadOk = !apiUrl; // если общего источника нет — считаем "загрузку" успешной (работаем локально)
 
 function esc(s) {
@@ -488,21 +489,30 @@ async function saveItems() {
   if (apiUrl && !serverLoadOk) {
     // Не даём перезаписать общую таблицу, пока не подтверждена успешная загрузка актуальных данных
     document.getElementById('syncStatus').innerHTML =
-      '⚠️ Изменение сохранено только локально — общая синхронизация отключена, пока не подгрузятся актуальные данные. Обнови страницу.';
+      '⚠️ Изменение сохранено только локально — общая синхронизация отключена, пока не подгрузятся актуальные данные. Обнови страницу.' +
+      (lastSaveError ? '<br>Причина: ' + esc(lastSaveError) : '');
     return;
   }
   if (apiUrl) {
     try {
       document.getElementById('syncStatus').textContent = 'Сохранение…';
-      await fetch(apiUrl, {
+      const body = JSON.stringify(items);
+      const res = await fetch(apiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify(items)
+        body
       });
+      const text = await res.text();
+      // Если doPost в Apps Script упал, Google всё равно часто отвечает 200, но HTML-страницей с текстом ошибки
+      if (!res.ok || /^\s*</.test(text) || /error|exception|ошибка/i.test(text.slice(0, 300))) {
+        const plain = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        throw new Error('сервер вернул ошибку (статус ' + res.status + ', размер данных ' + body.length + ' символов): ' + plain.slice(0, 300));
+      }
       document.getElementById('syncStatus').textContent = 'Синхронизировано ✓';
     } catch (e) {
       serverLoadOk = false;
-      document.getElementById('syncStatus').textContent = 'Не удалось сохранить на сервер: ' + e.message + ' (сохранено только локально).';
+      lastSaveError = e.message;
+      document.getElementById('syncStatus').textContent = '⚠️ Не удалось сохранить на сервер: ' + e.message + ' (сохранено только локально — после обновления страницы правка пропадёт).';
       console.error(e);
     }
   }
