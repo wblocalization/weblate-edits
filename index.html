@@ -357,9 +357,10 @@
 </div>
 
 <script>
-// ==== ВСТАВЬ СВОЮ ССЫЛКУ СЮДА (внутри кавычек), это надёжнее поля в интерфейсе ====
-const HARDCODED_API_URL = 'https://script.google.com/macros/s/AKfycbw1g8Em4AWbRnSfid-P-e0scIXjlJJEaHCOngaChO7cjM6AwGVmooXmG_9hpLQh3Cyblw/exec';
-//
+// ==== ССЫЛКА НА НОВЫЙ СКРИПТ (apps-script/Code.gs), внутри кавычек ====
+const HARDCODED_API_URL = 'NEW_API_URL_HERE';
+// Старый скрипт — только чтобы один раз перенести из него данные в новую таблицу
+const OLD_API_URL = 'https://script.google.com/macros/s/AKfycbw1g8Em4AWbRnSfid-P-e0scIXjlJJEaHCOngaChO7cjM6AwGVmooXmG_9hpLQh3Cyblw/exec';
 
 const STORAGE_KEY = 'pravki_perevodov';
 const API_KEY = 'pravki_api_url';
@@ -452,104 +453,150 @@ function maybeShowThanks() {
   localStorage.setItem(ADD_COUNTER_KEY, String(n));
 }
 
-// --- Загрузка / сохранение (локально или через общий Apps Script backend) ---
+// --- Загрузка / сохранение через общий Apps Script backend (apps-script/Code.gs) ---
+// Сервер хранит каждую правку отдельной строкой. Мы отправляем не весь список,
+// а только изменения этой вкладки: «добавить/обновить» и «удалить» — поэтому чужие правки не затираются.
+
 // Снимок данных сервера на момент последней загрузки/сохранения:
 // по нему понимаем, что именно изменили в этой вкладке
 let baseline = new Map();
 function rememberBaseline() {
   baseline = new Map(items.map(it => [it.id, JSON.stringify(it)]));
 }
+function setStatus(html) { document.getElementById('syncStatus').innerHTML = html; }
 
-async function fetchServerItems() {
-  const res = await fetch(apiUrl, { cache: 'no-store' });
+async function fetchServerItems(url = apiUrl) {
+  const res = await fetch(url, { cache: 'no-store' });
   const text = await res.text();
   let data;
   try {
     data = JSON.parse(text);
   } catch (parseErr) {
-    throw new Error('Сервер ответил не JSON-ом (статус ' + res.status + '). Похоже, доступ к развёртыванию не открыт для «Всех» — см. чат. Начало ответа: ' + text.slice(0, 120));
+    throw new Error('Сервер ответил не JSON-ом (статус ' + res.status + '). Похоже, доступ к развёртыванию не открыт для «Всех». Начало ответа: ' + text.slice(0, 120));
   }
-  return Array.isArray(data) ? data : [];
+  if (!Array.isArray(data)) throw new Error('Сервер вернул не список правок: ' + text.slice(0, 120));
+  return data;
 }
 
-// Берём свежий список с сервера и накладываем на него только изменения этой вкладки,
-// чтобы не затереть правки, которые коллеги добавили, пока у нас была открыта страница
-async function mergeWithServer() {
-  const localIds = new Set(items.map(it => it.id));
-  const deleted = new Set([...baseline.keys()].filter(id => !localIds.has(id)));
-  const changed = new Map(items
-    .filter(it => baseline.get(it.id) !== JSON.stringify(it))
-    .map(it => [it.id, it]));
-  const server = await fetchServerItems();
-  const merged = [];
-  const seen = new Set();
-  for (const it of server) {
-    if (deleted.has(it.id)) continue;
-    merged.push(changed.get(it.id) || it);
-    seen.add(it.id);
+async function postToServer(payload) {
+  const res = await fetch(apiUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: JSON.stringify(payload)
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch (e) {}
+  if (!res.ok || !data || data.ok !== true) {
+    const plain = (data && data.error) || text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300);
+    throw new Error('сервер вернул ошибку (статус ' + res.status + '): ' + plain);
   }
-  for (const [id, it] of changed) if (!seen.has(id)) merged.push(it);
-  items = merged;
+}
+
+function readLocalItems() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) { return []; }
+}
+
+// Правки, которые остались только в этом браузере (например, «пропавшие» из-за старой версии сайта)
+let localOnly = [];
+function showSyncedStatus(prefix = '') {
+  let html = prefix + 'Синхронизировано ✓';
+  if (localOnly.length) {
+    html += `<br>💡 Правок, которые есть только в этом браузере и отсутствуют в общей таблице: ${localOnly.length} ` +
+      `(возможно, они потерялись раньше). <button id="restoreLocalBtn">Посмотреть и вернуть</button>`;
+  }
+  setStatus(html);
+  const btn = document.getElementById('restoreLocalBtn');
+  if (btn) btn.addEventListener('click', restoreLocalOnly);
+}
+
+async function restoreLocalOnly() {
+  const list = localOnly.slice(0, 15).map(it =>
+    `• ${it.platform || ''} ${it.language || ''}: «${(it.oldText || '').slice(0, 40)}» → «${(it.newText || '').slice(0, 40)}»`).join('\n');
+  const more = localOnly.length > 15 ? `\n…и ещё ${localOnly.length - 15}` : '';
+  if (!confirm(`Вернуть эти правки в общую таблицу?\n\n${list}${more}\n\n` +
+    'Если какие-то из них коллеги удалили специально — их потом можно удалить снова.')) return;
+  try {
+    setStatus('Возвращаю правки…');
+    await postToServer({ action: 'upsert', items: localOnly });
+    localOnly = [];
+    items = await fetchServerItems();
+    rememberBaseline();
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+    showSyncedStatus('Правки возвращены. ');
+    render();
+  } catch (e) {
+    setStatus('⚠️ Не удалось вернуть правки: ' + esc(e.message));
+  }
 }
 
 async function loadItems() {
-  if (apiUrl) {
-    try {
-      document.getElementById('syncStatus').textContent = 'Загрузка из общего источника…';
-      items = await fetchServerItems();
-      rememberBaseline();
-      serverLoadOk = true;
-      document.getElementById('syncStatus').textContent = 'Синхронизировано ✓';
-      return;
-    } catch (e) {
-      serverLoadOk = false;
-      document.getElementById('syncStatus').innerHTML =
-        '⚠️ Не удалось загрузить общие данные (' + esc(e.message) + '). ' +
-        'Показаны только локальные данные этого браузера — <b>изменения сейчас НЕ будут сохраняться в общую таблицу</b>, ' +
-        'чтобы не затереть чужие правки. Обнови страницу или сообщи в чат, чтобы это починили, прежде чем что-то менять.';
-      console.error(e);
-    }
-  }
+  const local = readLocalItems();
+  if (!apiUrl) { items = local; return; }
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    items = raw ? JSON.parse(raw) : [];
-  } catch (e) { items = []; }
+    setStatus('Загрузка из общего источника…');
+    items = await fetchServerItems();
+    let prefix = '';
+    // Первый запуск новой таблицы: переносим данные из старой таблицы и из этого браузера
+    if (items.length === 0 && OLD_API_URL) {
+      let old = [];
+      try { old = await fetchServerItems(OLD_API_URL); } catch (e) { console.error('старая таблица недоступна', e); }
+      const byId = new Map();
+      [...old, ...local].forEach(it => { if (it && it.id) byId.set(it.id, it); });
+      if (byId.size) {
+        setStatus('Переношу ' + byId.size + ' правок в новую таблицу…');
+        await postToServer({ action: 'upsert', items: [...byId.values()] });
+        items = await fetchServerItems();
+        prefix = 'Перенесено правок в новую таблицу: ' + byId.size + '. ';
+      }
+    }
+    rememberBaseline();
+    serverLoadOk = true;
+    const serverIds = new Set(items.map(it => it.id));
+    localOnly = local.filter(it => it && it.id && !serverIds.has(it.id));
+    localStorage.setItem(STORAGE_KEY + '_backup', JSON.stringify(local)); // на всякий случай
+    showSyncedStatus(prefix);
+  } catch (e) {
+    serverLoadOk = false;
+    items = local;
+    setStatus('⚠️ Не удалось загрузить общие данные (' + esc(e.message) + '). ' +
+      'Показаны только локальные данные этого браузера — <b>изменения сейчас НЕ будут сохраняться в общую таблицу</b>. ' +
+      'Обнови страницу или сообщи в чат.');
+    console.error(e);
+  }
 }
 
 async function saveItems() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
   if (apiUrl && !serverLoadOk) {
-    // Не даём перезаписать общую таблицу, пока не подтверждена успешная загрузка актуальных данных
-    document.getElementById('syncStatus').innerHTML =
-      '⚠️ Изменение сохранено только локально — общая синхронизация отключена, пока не подгрузятся актуальные данные. Обнови страницу.' +
-      (lastSaveError ? '<br>Причина: ' + esc(lastSaveError) : '');
+    setStatus('⚠️ Изменение сохранено только локально — общая синхронизация отключена. Обнови страницу.' +
+      (lastSaveError ? '<br>Причина: ' + esc(lastSaveError) : ''));
     return;
   }
-  if (apiUrl) {
-    try {
-      document.getElementById('syncStatus').textContent = 'Сохранение…';
-      await mergeWithServer();
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
-      const body = JSON.stringify(items);
-      const res = await fetch(apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body
-      });
-      const text = await res.text();
-      // Если doPost в Apps Script упал, Google всё равно часто отвечает 200, но HTML-страницей с текстом ошибки
-      if (!res.ok || /^\s*</.test(text) || /error|exception|ошибка/i.test(text.slice(0, 300))) {
-        const plain = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-        throw new Error('сервер вернул ошибку (статус ' + res.status + ', размер данных ' + body.length + ' символов): ' + plain.slice(0, 300));
-      }
-      rememberBaseline();
-      document.getElementById('syncStatus').textContent = 'Синхронизировано ✓';
-    } catch (e) {
-      serverLoadOk = false;
-      lastSaveError = e.message;
-      document.getElementById('syncStatus').textContent = '⚠️ Не удалось сохранить на сервер: ' + e.message + ' (сохранено только локально — после обновления страницы правка пропадёт).';
-      console.error(e);
-    }
+  if (!apiUrl) return;
+  const localIds = new Set(items.map(it => it.id));
+  const deleted = [...baseline.keys()].filter(id => !localIds.has(id));
+  const changed = items.filter(it => baseline.get(it.id) !== JSON.stringify(it));
+  try {
+    setStatus('Сохранение…');
+    if (changed.length) await postToServer({ action: 'upsert', items: changed });
+    if (deleted.length) await postToServer({ action: 'delete', ids: deleted });
+    // подтягиваем свежий список — заодно видим правки коллег
+    items = await fetchServerItems();
+    rememberBaseline();
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+    lastSaveError = '';
+    showSyncedStatus();
+  } catch (e) {
+    serverLoadOk = false;
+    lastSaveError = e.message;
+    setStatus('⚠️ Не удалось сохранить на сервер: ' + esc(e.message) +
+      ' (сохранено только локально — после обновления страницы правка может пропасть, сообщи в чат).');
+    console.error(e);
   }
 }
 
