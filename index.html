@@ -453,19 +453,51 @@ function maybeShowThanks() {
 }
 
 // --- Загрузка / сохранение (локально или через общий Apps Script backend) ---
+// Снимок данных сервера на момент последней загрузки/сохранения:
+// по нему понимаем, что именно изменили в этой вкладке
+let baseline = new Map();
+function rememberBaseline() {
+  baseline = new Map(items.map(it => [it.id, JSON.stringify(it)]));
+}
+
+async function fetchServerItems() {
+  const res = await fetch(apiUrl, { cache: 'no-store' });
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (parseErr) {
+    throw new Error('Сервер ответил не JSON-ом (статус ' + res.status + '). Похоже, доступ к развёртыванию не открыт для «Всех» — см. чат. Начало ответа: ' + text.slice(0, 120));
+  }
+  return Array.isArray(data) ? data : [];
+}
+
+// Берём свежий список с сервера и накладываем на него только изменения этой вкладки,
+// чтобы не затереть правки, которые коллеги добавили, пока у нас была открыта страница
+async function mergeWithServer() {
+  const localIds = new Set(items.map(it => it.id));
+  const deleted = new Set([...baseline.keys()].filter(id => !localIds.has(id)));
+  const changed = new Map(items
+    .filter(it => baseline.get(it.id) !== JSON.stringify(it))
+    .map(it => [it.id, it]));
+  const server = await fetchServerItems();
+  const merged = [];
+  const seen = new Set();
+  for (const it of server) {
+    if (deleted.has(it.id)) continue;
+    merged.push(changed.get(it.id) || it);
+    seen.add(it.id);
+  }
+  for (const [id, it] of changed) if (!seen.has(id)) merged.push(it);
+  items = merged;
+}
+
 async function loadItems() {
   if (apiUrl) {
     try {
       document.getElementById('syncStatus').textContent = 'Загрузка из общего источника…';
-      const res = await fetch(apiUrl);
-      const text = await res.text();
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch (parseErr) {
-        throw new Error('Сервер ответил не JSON-ом (статус ' + res.status + '). Похоже, доступ к развёртыванию не открыт для «Всех» — см. чат. Начало ответа: ' + text.slice(0, 120));
-      }
-      items = Array.isArray(data) ? data : [];
+      items = await fetchServerItems();
+      rememberBaseline();
       serverLoadOk = true;
       document.getElementById('syncStatus').textContent = 'Синхронизировано ✓';
       return;
@@ -496,6 +528,8 @@ async function saveItems() {
   if (apiUrl) {
     try {
       document.getElementById('syncStatus').textContent = 'Сохранение…';
+      await mergeWithServer();
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
       const body = JSON.stringify(items);
       const res = await fetch(apiUrl, {
         method: 'POST',
@@ -508,6 +542,7 @@ async function saveItems() {
         const plain = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
         throw new Error('сервер вернул ошибку (статус ' + res.status + ', размер данных ' + body.length + ' символов): ' + plain.slice(0, 300));
       }
+      rememberBaseline();
       document.getElementById('syncStatus').textContent = 'Синхронизировано ✓';
     } catch (e) {
       serverLoadOk = false;
